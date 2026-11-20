@@ -1,29 +1,34 @@
 /*
-  ZART03_Receiver_C6.ino  -  low-cost DIY receiver for a Schneider Harmony Pocket Remote (ZART03)
-  ---------------------------------------------------------------------------------------------
+  ZART03_Receiver_C6.ino  -  low-cost DIY receiver for Schneider Harmony Pocket Remotes (ZART03 ... ZART10)
+  -------------------------------------------------------------------------------------------------
   Radio    : the ZART uses a TI CC2520 (IEEE 802.15.4, 2.4 GHz, O-QPSK). An ESP32-C6 / ESP32-H2
              has a native 802.15.4 radio, so no extra RF module is needed.
-  Hardware : ESP32-C6 Super Mini (or XIAO ESP32C6 / DevKitC-1 / ESP32-H2) + relay module
+  Hardware : ESP32-C6 Super Mini (or XIAO ESP32C6 / DevKitC-1 / ESP32-H2) + relay module (up to 10 relays)
   Core     : Arduino-ESP32 3.x / 4.x
              Tools > USB CDC On Boot : Enabled   (needed for the serial monitor on the USB port)
              Tools > Zigbee mode     : Disabled  (this sketch drives the radio directly)
 
   Decoded frame format (15 bytes, sniffed from a ZART03 on channel 15):
 
-      idx:  0  1   2  3  4  5  6  7  8  9 10  11   12 13 14
-            FE SQ  00 0F 00 0D A0 DD 00 00 00 BB   07 7E 04
-               |                              |
-               |                              +-- button bitmask: 01 = B1, 02 = B2, 04 = B3,
-               |                                  03 = B1+B2 (pairing), 00 = all released
+      idx:  0  1   2  3  4  5  6  7  8  9   10 11   12 13 14
+            FE SQ  00 0F 00 0D A0 DD 00 00  BH BL   07 7E 04
+               |                            \___/
+               |                              +-- button bitmask, 16 bit (BH = high, BL = low byte)
+               |                                  0001 = B1, 0002 = B2, 0004 = B3 ... 0200 = B10
+               |                                  0003 = B1+B2 (pairing), 0000 = all released
                +-- sequence counter, restarts at 01 on every press, wraps FF -> 00
       All other bytes are constant per remote and are stored as its "signature" (ID).
-      While a button is held the remote repeats the frame; after release it sends a few 00 frames.
+      While a button is held the remote repeats the frame; after release it sends a few 0000 frames.
+
+      Verified on a ZART03 (B1..B3 in BL, BH = 00). That B9/B10 of a ZART10 use BH bits 0/1 is an
+      assumption: check with sniff ('a') and adjust IDX_BTN_HI if a ZART08/ZART10 behaves differently.
 
   Works like the original ZARB receiver:
     - Pairing : start pair mode (BOOT 2..5 s, or 'P'), then hold B1 + B2 on the remote.
                 Up to 8 remotes can be paired.
     - Run     : button N -> relay N (momentary). Several buttons at once work.
-                Relays drop on the 00 release frame, or HOLD_MS after the last frame (out of range).
+                Optional "any" relay (like relay 11 of a ZARB11WSP): on while any relay is on.
+                Relays drop on the release frame, or HOLD_MS after the last frame (out of range).
                 One remote at a time; another remote takes over after OWNER_MS of silence.
     - Erase   : BOOT >= 6 s, or 'E'.
 
@@ -49,14 +54,17 @@
 #include "freertos/queue.h"
 
 // ---------------------------------------------------------------- configuration
-static const uint8_t  NUM_RELAYS       = 3;                       // ZART03 = 3 buttons (max 8)
-static const uint8_t  RELAY_PIN[8]     = {0, 1, 2, 3, 4, 5, 6, 7}; // only the first NUM_RELAYS are used
+// ZART03 = 3, ZART04 = 4, ZART06 = 6, ZART08 = 8, ZART10 = 10 buttons
+static const uint8_t  NUM_RELAYS       = 10;                                // 1..10
+static const uint8_t  RELAY_PIN[10]    = {0, 1, 2, 3, 4, 5, 6, 7, 18, 19};  // only the first NUM_RELAYS are used
+static const int8_t   ANY_RELAY_PIN    = -1;      // "any button" relay (like ZARB11WSP relay 11), -1 = off; e.g. 20
 static const bool     RELAY_ACTIVE_LOW = true;    // most cheap relay modules are active-low
 static const uint8_t  LED_PIN          = 15;      // on-board LED (Super Mini / XIAO: GPIO15)
 static const bool     LED_ACTIVE_LOW   = true;    // flip if the LED behaves inverted
 static const uint8_t  LEARN_BTN_PIN    = 9;       // BOOT button on C6 and H2 boards
 
 // Seeed XIAO ESP32C6 only: on-board RF switch (GPIO3 LOW = powered, GPIO14 LOW = built-in antenna)
+// Note: GPIO3 is also relay 4 in the default pin list - move that relay when using a XIAO.
 static const bool     XIAO_RF_SWITCH   = false;   // false for ESP32-C6 Super Mini
 static const bool     XIAO_EXT_ANTENNA = false;
 
@@ -73,8 +81,9 @@ static const uint32_t SURVEY_DWELL_MS  = 400;
 #define FRAME_LEN    15
 #define FRAME_MAGIC  0xFE
 #define IDX_SEQ      1
-#define IDX_BTN      11
-#define PAIR_MASK    0x03          // B1 + B2
+#define IDX_BTN_HI   10            // buttons 9..16 (assumed, see header)
+#define IDX_BTN_LO   11            // buttons 1..8
+#define PAIR_MASK    0x0003        // B1 + B2
 #define MAX_REMOTES  8
 
 struct Pkt {
@@ -87,7 +96,7 @@ struct Pkt {
 
 struct Remote {
   uint8_t valid;
-  uint8_t sig[FRAME_LEN];      // full frame; IDX_SEQ and IDX_BTN are ignored when comparing
+  uint8_t sig[FRAME_LEN];      // full frame; sequence and button bytes are ignored when comparing
 };
 
 // ---------------------------------------------------------------- globals
@@ -102,9 +111,9 @@ static bool     sniff = false, sniffAll = false, toggleMode = false;
 static int      activeRemote = -1;
 static uint32_t lastFrameMs  = 0;
 static int8_t   lastRssi     = 0;
-static uint8_t  buttons      = 0;              // bitmask from the last valid frame
-static uint8_t  prevEff      = 0;
-static uint8_t  latched      = 0;
+static uint16_t buttons      = 0;              // bitmask from the last valid frame
+static uint16_t prevEff      = 0;
+static uint16_t latched      = 0;
 static bool     suppress     = false;          // ignore buttons until release (right after pairing)
 
 // pairing
@@ -149,12 +158,20 @@ static void printHex(const uint8_t* d, uint8_t len) {
   for (uint8_t i = 0; i < len; i++) Serial.printf("%02X ", d[i]);
 }
 
-static void setRelay(uint8_t i, bool on) {
-  digitalWrite(RELAY_PIN[i], (on ^ RELAY_ACTIVE_LOW) ? HIGH : LOW);
+static void writeOut(uint8_t pin, bool on) {
+  digitalWrite(pin, (on ^ RELAY_ACTIVE_LOW) ? HIGH : LOW);
 }
 
 static void setLed(bool on) {
   digitalWrite(LED_PIN, (on ^ LED_ACTIVE_LOW) ? HIGH : LOW);
+}
+
+static uint16_t frameButtons(const uint8_t* d) {
+  return ((uint16_t)d[IDX_BTN_HI] << 8) | d[IDX_BTN_LO];
+}
+
+static bool isIgnoredIdx(uint8_t i) {
+  return i == IDX_SEQ || i == IDX_BTN_HI || i == IDX_BTN_LO;
 }
 
 static void saveConfig() {
@@ -180,7 +197,7 @@ static bool isZartFrame(const Pkt& p) {
 
 static bool sigMatch(const uint8_t* a, const uint8_t* b) {
   for (uint8_t i = 0; i < FRAME_LEN; i++) {
-    if (i == IDX_SEQ || i == IDX_BTN) continue;
+    if (isIgnoredIdx(i)) continue;
     if (a[i] != b[i]) return false;
   }
   return true;
@@ -194,15 +211,21 @@ static int findRemote(const Pkt& p) {
 
 static void printSig(const uint8_t* s) {
   for (uint8_t i = 0; i < FRAME_LEN; i++) {
-    if (i == IDX_SEQ || i == IDX_BTN) Serial.print("-- ");
+    if (isIgnoredIdx(i)) Serial.print("-- ");
     else Serial.printf("%02X ", s[i]);
   }
+}
+
+static void printButtons(uint16_t b) {
+  for (int i = 0; i < 16; i++) if (b & (1u << i)) Serial.printf(" B%d", i + 1);
 }
 
 static void printConfig() {
   if (radioChan) Serial.printf("Radio channel: %u (%u MHz)\n", radioChan, 2405 + 5 * (radioChan - 11));
   else           Serial.println("Radio channel: unknown - run survey ('h')");
-  Serial.printf("Relays: %u   Toggle mode: %s\n", NUM_RELAYS, toggleMode ? "ON" : "off (momentary)");
+  Serial.printf("Relays: %u", NUM_RELAYS);
+  if (ANY_RELAY_PIN >= 0) Serial.printf(" + 'any' relay on GPIO%d", ANY_RELAY_PIN);
+  Serial.printf("   Toggle mode: %s\n", toggleMode ? "ON" : "off (momentary)");
   int n = 0;
   for (int r = 0; r < MAX_REMOTES; r++) {
     if (!remotes[r].valid) continue;
@@ -225,7 +248,7 @@ static void startPair() {
 
 static void handlePairPkt(const Pkt& p) {
   if (!isZartFrame(p) || p.rssi < PAIR_RSSI) return;
-  if ((p.data[IDX_BTN] & PAIR_MASK) != PAIR_MASK) return;
+  if ((frameButtons(p.data) & PAIR_MASK) != PAIR_MASK) return;
 
   pairing = false;
   suppress = true;                       // don't fire relays 1+2 until the buttons are released
@@ -337,7 +360,7 @@ static void handleRunPkt(const Pkt& p) {
   activeRemote = r;
   lastFrameMs  = now;
   lastRssi     = p.rssi;
-  buttons      = p.data[IDX_BTN];
+  buttons      = frameButtons(p.data);
   if (suppress && buttons == 0) suppress = false;
 }
 
@@ -345,7 +368,8 @@ static void handleRunPkt(const Pkt& p) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  for (int i = 0; i < NUM_RELAYS; i++) { pinMode(RELAY_PIN[i], OUTPUT); setRelay(i, false); }
+  for (int i = 0; i < NUM_RELAYS; i++) { pinMode(RELAY_PIN[i], OUTPUT); writeOut(RELAY_PIN[i], false); }
+  if (ANY_RELAY_PIN >= 0) { pinMode(ANY_RELAY_PIN, OUTPUT); writeOut(ANY_RELAY_PIN, false); }
   pinMode(LED_PIN, OUTPUT);
   setLed(false);
   pinMode(LEARN_BTN_PIN, INPUT_PULLUP);
@@ -366,7 +390,7 @@ void setup() {
   esp_ieee802154_set_rx_when_idle(true);
   setChannel(radioChan ? radioChan : 11);
 
-  Serial.println("\nZART03 DIY receiver (802.15.4) ready. Commands: h + - s a P E p t");
+  Serial.println("\nZART DIY receiver (802.15.4) ready. Commands: h + - s a P E p t");
   printConfig();
 }
 
@@ -388,7 +412,7 @@ void loop() {
       printHex(p.data, p.len);
       if (isZartFrame(p)) {
         int r = findRemote(p);
-        Serial.printf(" seq %02X btn %02X ", p.data[IDX_SEQ], p.data[IDX_BTN]);
+        Serial.printf(" seq %02X btn %04X ", p.data[IDX_SEQ], frameButtons(p.data));
         if (r >= 0) Serial.printf("remote %d", r + 1); else Serial.print("(not paired)");
       }
       Serial.println();
@@ -405,17 +429,18 @@ void loop() {
   if (now - lastFrameMs > HOLD_MS) { buttons = 0; suppress = false; }
   if (now - lastFrameMs > OWNER_MS) activeRemote = -1;
 
-  // relays
-  uint8_t eff = (surveying || pairing || suppress) ? 0 : buttons;
+  // effective buttons (only the ones that have a relay)
+  const uint16_t relayMask = (uint16_t)((1u << NUM_RELAYS) - 1);
+  uint16_t eff = (surveying || pairing || suppress) ? 0 : (buttons & relayMask);
 
   // one compact line per button change (only when sniff is off)
-  static uint8_t shownEff = 0;
-  static int     shownRemote = -1;
+  static uint16_t shownEff = 0;
+  static int      shownRemote = -1;
   if (eff != shownEff) {
     if (!sniff) {
       if (eff) {
         Serial.printf("remote %d:", activeRemote + 1);
-        for (int i = 0; i < 8; i++) if (eff & (1 << i)) Serial.printf(" B%d", i + 1);
+        printButtons(eff);
         Serial.printf(" pressed (rssi %d)\n", lastRssi);
         shownRemote = activeRemote;
       } else {
@@ -425,10 +450,13 @@ void loop() {
     }
     shownEff = eff;
   }
+
+  // relays
   if (toggleMode) latched ^= (eff & ~prevEff);             // rising edges toggle
   prevEff = eff;
-  uint8_t out = toggleMode ? latched : eff;
-  for (int i = 0; i < NUM_RELAYS; i++) setRelay(i, out & (1 << i));
+  uint16_t out = toggleMode ? latched : eff;
+  for (int i = 0; i < NUM_RELAYS; i++) writeOut(RELAY_PIN[i], out & (1u << i));
+  if (ANY_RELAY_PIN >= 0) writeOut(ANY_RELAY_PIN, out != 0);
 
   // LED
   if (btnDownAt && now - btnDownAt >= 6000)      setLed((now / 60) & 1);    // release now = erase
